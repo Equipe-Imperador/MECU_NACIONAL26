@@ -1,9 +1,3 @@
-/*
- * PROJETO: MECU - MAIN CONTROL UNIT (TELEMETRIA MASTER)
- * VERSÃO: 7.1 (SD Incremental, FreeRTOS, SIM7600 MQTT, CAN, DWIN Multi-Telas)
- * DESCRIÇÃO: Nó central. Lê CAN a 100Hz, salva no SD, envia via 4G (5Hz) e controla Painel.
- */
-
 #include <mcp_can.h>
 #include <SPI.h>
 #include <SD.h>
@@ -43,30 +37,36 @@
 #define SD_MOSI 23
 
 // ====================================================================
-// 2. CONTROLE DE TELAS (DWIN) - Altere para bater com seu software DGUS
+// 2. CONTROLE DE TELAS (DWIN) - Altere para bater com seu DGUS
 // ====================================================================
-#define TELA_PRINCIPAL  0  // Ex: ID da Tela Principal (Velocidade, RPM)
-#define TELA_SECUNDARIA 1  // Ex: ID da Tela Secundária (Temperaturas)
-#define TELA_BOX        2  // Ex: ID da Tela de Aviso "VÁ PARA O BOX"
+#define TELA_PRINCIPAL  0  
+#define TELA_SECUNDARIA 1  
+#define TELA_BOX        2  
 
 volatile uint8_t telaAtual = TELA_PRINCIPAL;
 volatile bool forcarMudancaTela = true; 
 
 // ====================================================================
-// 3. ESTRUTURAS E GLOBAIS
+// 3. ESTRUTURA DE DADOS UNIFICADA 
 // ====================================================================
 struct TelemetriaGlobal {
     uint32_t timestamp;
+    
+    // TX 1 (CVT)
     uint16_t rpm;
-    float velocidade, tempCVT, vBat, pTras, corrente, tempBat;
-    int cursoF, cursoA, pFrente, dif;
-    float accX, accY, accZ, gyroX, gyroY, gyroZ, angX, angY, angZ;
+    float velocidade, tempCVT;
+
+    // RECU
+    float vBat, presTras, tempBat, perT, perF;
+
+    // FECU
+    float pedalFreio, presDiant, presCM;
+    float accX, accY, accZ; // Eixo Z adicionado aqui
+    float v_LF, v_RF, acionamentoDif;
 } dados;
 
 QueueHandle_t filaSD;
 SemaphoreHandle_t mutexDados;
-
-// Globais para SD
 File dataFile;
 char nomeArquivo[30];
 
@@ -106,8 +106,8 @@ void setup() {
     mutexDados = xSemaphoreCreateMutex();
     
     // Inicia Seriais
-    Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX); // Modem
-    Serial2.begin(9600, SERIAL_8N1, DWIN_RX, DWIN_TX);     // DWIN
+    Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX); 
+    Serial2.begin(9600, SERIAL_8N1, DWIN_RX, DWIN_TX);     
 
     // Inicia CAN
     SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
@@ -132,7 +132,8 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            dataFile.println("ms;rpm;vel;tempCVT;vBat;pTras;pFrente;dif;accX;accY;accZ");
+            // Cabeçalho completo
+            dataFile.println("ms;rpm;vel;tCVT;vBat;pTras;tBat;perT;perF;pedF;pDiant;pCM;accX;accY;accZ;vLF;vRF;dif");
             dataFile.flush();
             Serial.printf("✅ SD Inicializado. Arquivo: %s\n", nomeArquivo);
         }
@@ -186,25 +187,33 @@ void vTaskCAN(void *pvParameters) {
                 float valorFloat = (float)valorInt / 100.0f;
 
                 switch (rxId) {
-                    case 0x200: dados.rpm = valorInt; break; 
+                    // TX 1
+                    case 0x200: dados.rpm = (uint16_t)valorFloat; break; 
                     case 0x201: dados.velocidade = valorFloat; break;
                     case 0x202: dados.tempCVT = valorFloat; break;
+                    
+                    // RECU
                     case 0x300: dados.vBat = valorFloat; break;
-                    case 0x301: dados.pTras = valorFloat; break;
-                    case 0x302: dados.corrente = valorFloat; break;
+                    case 0x301: dados.presTras = valorFloat; break;
                     case 0x303: dados.tempBat = valorFloat; break;
-                    case 0x400: dados.cursoF = valorInt; break; 
-                    case 0x401: dados.cursoA = valorInt; break;
-                    case 0x402: dados.pFrente = valorInt; break;
-                    case 0x403: dados.dif = valorInt; break;
+                    case 0x304: dados.perT = valorFloat; break;
+                    case 0x305: dados.perF = valorFloat; break;
+
+                    // FECU
+                    case 0x400: dados.pedalFreio = valorFloat; break;
+                    case 0x402: dados.presDiant = valorFloat; break;
+                    case 0x403: dados.presCM = valorFloat; break;
                     case 0x404: dados.accX = valorFloat; break;
                     case 0x405: dados.accY = valorFloat; break;
-                    case 0x406: dados.accZ = valorFloat; break;
+                    case 0x406: dados.v_LF = valorFloat; break;
+                    case 0x407: dados.v_RF = valorFloat; break;
+                    case 0x408: dados.acionamentoDif = valorFloat; break;
+                    case 0x409: dados.accZ = valorFloat; break; // <--- Eixo Z Adicionado!
                 }
             }
             xSemaphoreGive(mutexDados);
 
-            // Grava a 100Hz
+            // Grava a 100Hz na fila
             if (millis() - lastLogTime >= 10) {
                 xQueueSend(filaSD, &dados, 0);
                 lastLogTime = millis();
@@ -221,17 +230,14 @@ void vTaskDWIN(void *pvParameters) {
     uint32_t ultimoTempoBotao = 0;
 
     for (;;) {
-        // --- 1. Botão com Debounce ---
+        // --- 1. Lógica do Botão com Debounce ---
         if (digitalRead(PIN_BOTAO_PAINEL) == LOW && (millis() - ultimoTempoBotao > 300)) {
             ultimoTempoBotao = millis();
             
-            if (telaAtual == TELA_PRINCIPAL) {
-                telaAtual = TELA_SECUNDARIA;
-            } else if (telaAtual == TELA_SECUNDARIA) {
-                telaAtual = TELA_PRINCIPAL;
-            } else if (telaAtual == TELA_BOX) {
-                telaAtual = TELA_PRINCIPAL;
-            }
+            if (telaAtual == TELA_PRINCIPAL) telaAtual = TELA_SECUNDARIA;
+            else if (telaAtual == TELA_SECUNDARIA) telaAtual = TELA_PRINCIPAL;
+            else if (telaAtual == TELA_BOX) telaAtual = TELA_PRINCIPAL; // Piloto fecha aviso do BOX
+            
             forcarMudancaTela = true;
         }
 
@@ -260,20 +266,20 @@ void vTaskDWIN(void *pvParameters) {
 // TAREFA SD CARD (Core 0)
 // ====================================================================
 void vTaskSD(void *pvParameters) {
-    TelemetriaGlobal dLog;
-    int counter = 0;
+    TelemetriaGlobal d;
+    int ct = 0;
     
     for (;;) {
-        if (xQueueReceive(filaSD, &dLog, portMAX_DELAY)) {
+        if (xQueueReceive(filaSD, &d, portMAX_DELAY)) {
             if (dataFile) {
-                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.1f;%d;%d;%.2f;%.2f;%.2f\n", 
-                                dLog.timestamp, dLog.rpm, dLog.velocidade, 
-                                dLog.tempCVT, dLog.vBat, dLog.pTras, 
-                                dLog.pFrente, dLog.dif, dLog.accX, dLog.accY, dLog.accZ);
+                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.2f;%.1f;%.0f;%.0f;%.1f;%.2f;%.2f;%.2f;%.2f;%.2f;%.1f;%.1f;%.0f\n", 
+                    d.timestamp, d.rpm, d.velocidade, d.tempCVT, d.vBat, 
+                    d.presTras, d.tempBat, d.perT, d.perF, d.pedalFreio, 
+                    d.presDiant, d.presCM, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.acionamentoDif);
                 
-                if (++counter >= 50) { // Flush a cada meio segundo
+                if (++ct >= 50) { // Flush a cada meio segundo (garante n perder dados na vibração)
                     dataFile.flush();
-                    counter = 0;
+                    ct = 0;
                 }
             }
         }
@@ -318,16 +324,29 @@ void vTaskModem(void *pvParameters) {
         } 
         
         if (mqttClient.connected()) {
-            StaticJsonDocument<512> doc;
+            StaticJsonDocument<1024> doc; 
             
             xSemaphoreTake(mutexDados, portMAX_DELAY);
             doc["rpm"] = dados.rpm;
             doc["vel"] = dados.velocidade;
-            doc["vbat"] = dados.vBat;
-            // ... adicione as outras variaveis no JSON aqui ...
+            doc["tCVT"] = dados.tempCVT;
+            doc["vBat"] = dados.vBat;
+            doc["pTras"] = dados.presTras;
+            doc["tBat"] = dados.tempBat;
+            doc["perT"] = dados.perT;
+            doc["perF"] = dados.perF;
+            doc["pedF"] = dados.pedalFreio;
+            doc["pDiant"] = dados.presDiant;
+            doc["pCM"] = dados.presCM;
+            doc["accX"] = dados.accX;
+            doc["accY"] = dados.accY;
+            doc["accZ"] = dados.accZ; // <--- Eixo Z Adicionado no JSON
+            doc["vLF"] = dados.v_LF;
+            doc["vRF"] = dados.v_RF;
+            doc["dif"] = dados.acionamentoDif;
             xSemaphoreGive(mutexDados);
 
-            char buffer[512];
+            char buffer[1024];
             size_t n = serializeJson(doc, buffer);
             mqttClient.publish(topic_telemetry, buffer, n);
             
