@@ -37,7 +37,7 @@
 #define SD_MOSI 23
 
 // ====================================================================
-// 2. CONTROLE DE TELAS (DWIN) - Altere para bater com seu DGUS
+// 2. CONTROLE DE TELAS (DWIN)
 // ====================================================================
 #define TELA_PRINCIPAL  0  
 #define TELA_SECUNDARIA 1  
@@ -52,17 +52,18 @@ volatile bool forcarMudancaTela = true;
 struct TelemetriaGlobal {
     uint32_t timestamp;
     
-    // TX 1 (CVT)
+    // PTECU (Powertrain) + Velocidade Rodas Dianteiras
     uint16_t rpm;
     float velocidade, tempCVT;
+    float v_LF, v_RF;
 
-    // RECU
+    // RECU (Traseira)
     float vBat, presTras, tempBat, perT, perF;
 
-    // FECU
+    // FECU (Dianteira)
     float pedalFreio, presDiant, presCM;
-    float accX, accY, accZ; // Eixo Z adicionado aqui
-    float v_LF, v_RF, acionamentoDif;
+    float accX, accY, accZ; 
+    float acionamentoDif;
 } dados;
 
 QueueHandle_t filaSD;
@@ -100,7 +101,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 // ====================================================================
 void setup() {
     Serial.begin(921600);
-    Serial.println("\n🔥 MECU INICIALIZANDO (FreeRTOS) 🔥");
+    Serial.println("\n MECU INICIALIZANDO (FreeRTOS) ");
 
     pinMode(PIN_BOTAO_PAINEL, INPUT_PULLUP);
     mutexDados = xSemaphoreCreateMutex();
@@ -112,17 +113,17 @@ void setup() {
     // Inicia CAN
     SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
     if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
-        Serial.println("❌ Erro Crítico: Falha no MCP2515 (CAN)!");
+        Serial.println(" Erro Crítico: Falha no MCP2515 (CAN)!");
         delay(3000);
     } else {
         CAN0.setMode(MCP_NORMAL);
-        Serial.println("✅ CAN Inicializada.");
+        Serial.println(" CAN Inicializada.");
     }
 
     // Inicia SD Incremental
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     if (!SD.begin(SD_CS, sdSPI)) {
-        Serial.println("❌ Erro Crítico: Falha no Cartão SD!");
+        Serial.println(" Erro Crítico: Falha no Cartão SD!");
     } else {
         int n = 1;
         while (n < 1000) {
@@ -132,10 +133,9 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            // Cabeçalho completo
             dataFile.println("ms;rpm;vel;tCVT;vBat;pTras;tBat;perT;perF;pedF;pDiant;pCM;accX;accY;accZ;vLF;vRF;dif");
             dataFile.flush();
-            Serial.printf("✅ SD Inicializado. Arquivo: %s\n", nomeArquivo);
+            Serial.printf(" SD Inicializado. Arquivo: %s\n", nomeArquivo);
         }
     }
 
@@ -164,7 +164,7 @@ void setup() {
 void loop() { vTaskDelete(NULL); }
 
 // ====================================================================
-// TAREFA CAN (Core 1)
+// TAREFA CAN (Core 1) -> RECEBE TUDO DAS ECUs E ATUALIZA A STRUCT
 // ====================================================================
 void vTaskCAN(void *pvParameters) {
     long unsigned int rxId;
@@ -187,33 +187,33 @@ void vTaskCAN(void *pvParameters) {
                 float valorFloat = (float)valorInt / 100.0f;
 
                 switch (rxId) {
-                    // TX 1
+                    // --- GRUPO 0x200: POWERTRAIN E RODAS DIANTEIRAS ---
                     case 0x200: dados.rpm = (uint16_t)valorFloat; break; 
                     case 0x201: dados.velocidade = valorFloat; break;
                     case 0x202: dados.tempCVT = valorFloat; break;
+                    case 0x203: dados.v_LF = valorFloat; break; // Veio da FECU
+                    case 0x204: dados.v_RF = valorFloat; break; // Veio da FECU
                     
-                    // RECU
+                    // --- GRUPO 0x300: RECU (Traseira) ---
                     case 0x300: dados.vBat = valorFloat; break;
                     case 0x301: dados.presTras = valorFloat; break;
                     case 0x303: dados.tempBat = valorFloat; break;
                     case 0x304: dados.perT = valorFloat; break;
                     case 0x305: dados.perF = valorFloat; break;
 
-                    // FECU
+                    // --- GRUPO 0x400: FECU (Dianteira / Dinâmica) ---
                     case 0x400: dados.pedalFreio = valorFloat; break;
                     case 0x402: dados.presDiant = valorFloat; break;
                     case 0x403: dados.presCM = valorFloat; break;
                     case 0x404: dados.accX = valorFloat; break;
                     case 0x405: dados.accY = valorFloat; break;
-                    case 0x406: dados.v_LF = valorFloat; break;
-                    case 0x407: dados.v_RF = valorFloat; break;
-                    case 0x408: dados.acionamentoDif = valorFloat; break;
-                    case 0x409: dados.accZ = valorFloat; break; // <--- Eixo Z Adicionado!
+                    case 0x406: dados.accZ = valorFloat; break; 
+                    case 0x407: dados.acionamentoDif = valorFloat; break; 
                 }
             }
             xSemaphoreGive(mutexDados);
 
-            // Grava a 100Hz na fila
+            // Grava a 100Hz na fila do SD
             if (millis() - lastLogTime >= 10) {
                 xQueueSend(filaSD, &dados, 0);
                 lastLogTime = millis();
@@ -236,7 +236,7 @@ void vTaskDWIN(void *pvParameters) {
             
             if (telaAtual == TELA_PRINCIPAL) telaAtual = TELA_SECUNDARIA;
             else if (telaAtual == TELA_SECUNDARIA) telaAtual = TELA_PRINCIPAL;
-            else if (telaAtual == TELA_BOX) telaAtual = TELA_PRINCIPAL; // Piloto fecha aviso do BOX
+            else if (telaAtual == TELA_BOX) telaAtual = TELA_PRINCIPAL;
             
             forcarMudancaTela = true;
         }
@@ -254,7 +254,6 @@ void vTaskDWIN(void *pvParameters) {
             uint16_t rpmTela = dados.rpm;
             xSemaphoreGive(mutexDados);
 
-            // Exemplo envio RPM (Endereço 0x3100)
             byte frameRpm[8] = {0x5A, 0xA5, 0x05, 0x82, 0x31, 0x00, (byte)(rpmTela >> 8), (byte)(rpmTela & 0xFF)};
             Serial2.write(frameRpm, 8);
         }
@@ -340,7 +339,7 @@ void vTaskModem(void *pvParameters) {
             doc["pCM"] = dados.presCM;
             doc["accX"] = dados.accX;
             doc["accY"] = dados.accY;
-            doc["accZ"] = dados.accZ; // <--- Eixo Z Adicionado no JSON
+            doc["accZ"] = dados.accZ;
             doc["vLF"] = dados.v_LF;
             doc["vRF"] = dados.v_RF;
             doc["dif"] = dados.acionamentoDif;
@@ -352,6 +351,6 @@ void vTaskModem(void *pvParameters) {
             
             mqttClient.loop();
         }
-        vTaskDelay(pdMS_TO_TICKS(200)); // Envio a 5Hz
+        vTaskDelay(pdMS_TO_TICKS(200)); // Envio JSON via GSM a 5Hz
     }
 }
