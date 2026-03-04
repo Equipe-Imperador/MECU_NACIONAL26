@@ -156,7 +156,7 @@ void setup() {
         xTaskCreatePinnedToCore(vTaskDWIN, "DWIN", 2048, NULL, 2, NULL, 1);
 
         // CORE 0: Comunicação Nuvem e SD
-        xTaskCreatePinnedToCore(vTaskModem, "GSM", 8192, NULL, 1, NULL, 0);
+        xTaskCreatePinnedToCore(vTaskModem, "GSM", 8192, NULL, 0, NULL, 0);
         xTaskCreatePinnedToCore(vTaskSD, "SD", 4096, NULL, 2, NULL, 0);
     }
 }
@@ -305,23 +305,31 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 // ====================================================================
-// TAREFA MODEM E MQTT (Core 0)
+// TAREFA MODEM E MQTT (Core 0) - ATUALIZADA COM LÓGICA DE CASCATA
 // ====================================================================
 void vTaskModem(void *pvParameters) {
     mqttClient.setServer(mqtt_server, mqtt_port);
     mqttClient.setCallback(mqttCallback);
 
     for (;;) {
-        if (!modem.isNetworkConnected()) modem.waitForNetwork(10000);
-        if (modem.isNetworkConnected() && !modem.isGprsConnected()) modem.gprsConnect(apn, "", "");
-
-        if (modem.isGprsConnected() && !mqttClient.connected()) {
+        // --- 1. LÓGICA DE CONEXÃO NÃO-BLOQUEANTE ---
+        if (!modem.isNetworkConnected()) {
+            // Tenta achar a rede por no máximo 1 segundo (evita travar o Core 0)
+            modem.waitForNetwork(1000); 
+        } 
+        else if (!modem.isGprsConnected()) {
+            // Se tem rede mas não tem internet, conecta o GPRS
+            modem.gprsConnect(apn, "", "");
+        } 
+        else if (!mqttClient.connected()) {
+            // Se tem internet mas perdeu o MQTT, reconecta e reassina o tópico
             String clientId = "MECU-" + String(random(0xffff), HEX);
             if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-                mqttClient.subscribe(topic_command);
+                mqttClient.subscribe(topic_command); 
             }
-        } 
-        
+        }
+
+        // --- 2. ENVIO DE DADOS ---
         if (mqttClient.connected()) {
             StaticJsonDocument<1024> doc; 
             
@@ -351,6 +359,8 @@ void vTaskModem(void *pvParameters) {
             
             mqttClient.loop();
         }
-        vTaskDelay(pdMS_TO_TICKS(200)); // Envio JSON via GSM a 5Hz
+        
+        // delay para enviar a 5Hz
+        vTaskDelay(pdMS_TO_TICKS(200)); 
     }
 }
