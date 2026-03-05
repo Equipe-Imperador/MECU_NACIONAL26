@@ -79,7 +79,7 @@ MCP_CAN CAN0(CAN_CS);
 SPIClass sdSPI(VSPI);
 
 // Configurações MQTT e Rede
-const char apn[] = "claro.com.br";
+const char apn[] = "java.claro.com.br";
 const char* mqtt_server = "72.60.141.159";
 const int mqtt_port = 1883;
 const char* mqtt_user = "imperador_mqtt";
