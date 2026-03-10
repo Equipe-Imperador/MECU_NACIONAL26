@@ -144,7 +144,8 @@ void vTaskCAN(void *pvParameters) {
     for (;;) {
         esp_task_wdt_reset();
         
-        if (CAN0.checkReceive() == CAN_MSGAVAIL) {
+        // Usando o 'while' para esvaziar completamente o buffer do MCP2515 a cada ciclo
+        while (CAN0.checkReceive() == CAN_MSGAVAIL) {
             CAN0.readMsgBuf(&rxId, &len, rxBuf);
             
             xSemaphoreTake(mutexDados, portMAX_DELAY);
@@ -188,12 +189,19 @@ void vTaskCAN(void *pvParameters) {
                 }
             }
             xSemaphoreGive(mutexDados);
-
-            if (millis() - lastLogTime >= 10) {
-                xQueueSend(filaSD, &dados, 0);
-                lastLogTime = millis();
-            }
         }
+
+        // Envio para a fila do SD movido para fora do while
+        // Garante que o SD vai receber o frame mais atualizado a cada 10ms cravados
+        if (millis() - lastLogTime >= 10) {
+            xSemaphoreTake(mutexDados, portMAX_DELAY);
+            TelemetriaGlobal copiaDados = dados;
+            xSemaphoreGive(mutexDados);
+            
+            xQueueSend(filaSD, &copiaDados, 0);
+            lastLogTime = millis();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
 }
