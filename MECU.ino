@@ -11,34 +11,23 @@
 #include <ArduinoJson.h>
 
 // ====================================================================
-// 1. DEFINIÇÕES DE PINOS (Hardware Final)
+// 1. DEFINIÇÕES DE PINOS E ESTRUTURAS
 // ====================================================================
 #define PIN_BOTAO_PAINEL 32
-
-// DWIN (Serial 2)
-#define DWIN_TX 25 
-#define DWIN_RX 26 
-
-// MODEM SIM7600 (Serial 1)
-#define MODEM_TX 16 
-#define MODEM_RX 17 
-
-// CAN (Pinos customizados para SPI)
+#define DWIN_TX 26
+#define DWIN_RX 25 
+#define MODEM_TX 17
+#define MODEM_RX 16 
 #define CAN_CS 15
 #define CAN_INT 27
 #define CAN_SCK 14
 #define CAN_MISO 12
 #define CAN_MOSI 13
-
-// SD CARD (Pinos VSPI)
 #define SD_CS 5
 #define SD_SCK 18
 #define SD_MISO 19
 #define SD_MOSI 23
 
-// ====================================================================
-// 2. CONTROLE DE TELAS (DWIN)
-// ====================================================================
 #define TELA_PRINCIPAL  0  
 #define TELA_SECUNDARIA 1  
 #define TELA_BOX        2  
@@ -46,24 +35,13 @@
 volatile uint8_t telaAtual = TELA_PRINCIPAL;
 volatile bool forcarMudancaTela = true; 
 
-// ====================================================================
-// 3. ESTRUTURA DE DADOS UNIFICADA 
-// ====================================================================
 struct TelemetriaGlobal {
     uint32_t timestamp;
-    
-    // PTECU (Powertrain) + Velocidade Rodas Dianteiras
     uint16_t rpm;
-    float velocidade, tempCVT;
-    float v_LF, v_RF;
-
-    // RECU (Traseira)
+    float velocidade, tempCVT, v_LF, v_RF;
     float vBat, presTras, tempBat, perT, perF;
-
-    // FECU (Dianteira)
-    float pedalFreio, presDiant, presCM;
-    float accX, accY, accZ; 
-    float acionamentoDif;
+    float pedalFreio, presDiant, presCM, accX, accY, accZ; 
+    bool correnteDif; 
 } dados;
 
 QueueHandle_t filaSD;
@@ -71,15 +49,13 @@ SemaphoreHandle_t mutexDados;
 File dataFile;
 char nomeArquivo[30];
 
-// Instâncias de Hardware
 TinyGsm modem(Serial1);
 TinyGsmClient gsmClient(modem);
 PubSubClient mqttClient(gsmClient);
 MCP_CAN CAN0(CAN_CS);
-SPIClass sdSPI(VSPI);
+SPIClass sdSPI(HSPI); 
 
-// Configurações MQTT e Rede
-const char apn[] = "java.claro.com.br";
+const char apn[] = "claro.com.br";
 const char* mqtt_server = "72.60.141.159";
 const int mqtt_port = 1883;
 const char* mqtt_user = "imperador_mqtt";
@@ -87,43 +63,37 @@ const char* mqtt_pass = "imperador25";
 const char* topic_telemetry = "imperador/telemetria";
 const char* topic_command = "imperador/comandos/box";
 
-// ====================================================================
-// 4. PROTÓTIPOS DE FUNÇÕES
-// ====================================================================
 void vTaskCAN(void *pvParameters);
 void vTaskModem(void *pvParameters);
 void vTaskSD(void *pvParameters);
 void vTaskDWIN(void *pvParameters);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
+void enviarMsgCAN(uint32_t id, float valor);
 
 // ====================================================================
-// SETUP
+// 2. SETUP
 // ====================================================================
 void setup() {
     Serial.begin(921600);
-    Serial.println("\n MECU INICIALIZANDO (FreeRTOS) ");
+    Serial.println("\n [MECU] MODO DEBUG CAN ATIVADO ");
 
     pinMode(PIN_BOTAO_PAINEL, INPUT_PULLUP);
     mutexDados = xSemaphoreCreateMutex();
     
-    // Inicia Seriais
     Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX); 
     Serial2.begin(9600, SERIAL_8N1, DWIN_RX, DWIN_TX);     
 
-    // Inicia CAN
     SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
     if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
-        Serial.println(" Erro Crítico: Falha no MCP2515 (CAN)!");
-        delay(3000);
+        Serial.println(" !!! ERRO: MCP2515 NÃO INICIALIZOU !!!");
     } else {
         CAN0.setMode(MCP_NORMAL);
-        Serial.println(" CAN Inicializada.");
+        Serial.println(" >>> CAN Inicializada e em modo NORMAL.");
     }
 
-    // Inicia SD Incremental
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     if (!SD.begin(SD_CS, sdSPI)) {
-        Serial.println(" Erro Crítico: Falha no Cartão SD!");
+        Serial.println(" Erro: SD Card falhou.");
     } else {
         int n = 1;
         while (n < 1000) {
@@ -133,39 +103,37 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            dataFile.println("ms;rpm;vel;tCVT;vBat;pTras;tBat;perT;perF;pedF;pDiant;pCM;accX;accY;accZ;vLF;vRF;dif");
+            dataFile.println("ms;rpm;vel;tCVT;vBat;pTras;tBat;perT;perF;pedF;pDiant;pCM;accX;accY;accZ;vLF;vRF;corrDif");
             dataFile.flush();
-            Serial.printf(" SD Inicializado. Arquivo: %s\n", nomeArquivo);
         }
     }
 
-    // Configura Watchdog (8 segundos)
-    esp_task_wdt_config_t twdt_config = {
-        .timeout_ms = 8000, 
-        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-        .trigger_panic = true
-    };
+    esp_task_wdt_config_t twdt_config = { .timeout_ms = 8000, .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, .trigger_panic = true };
+    esp_task_wdt_deinit(); 
     esp_task_wdt_init(&twdt_config);
 
-    // Criação da Fila do SD
     filaSD = xQueueCreate(100, sizeof(TelemetriaGlobal));
-
     if (filaSD != NULL) {
-        // CORE 1: Hardware em Tempo Real
         xTaskCreatePinnedToCore(vTaskCAN, "CAN", 4096, NULL, 3, NULL, 1);
         xTaskCreatePinnedToCore(vTaskDWIN, "DWIN", 2048, NULL, 2, NULL, 1);
-
-        // CORE 0: Comunicação Nuvem e SD
-        xTaskCreatePinnedToCore(vTaskModem, "GSM", 8192, NULL, 0, NULL, 0);
+        xTaskCreatePinnedToCore(vTaskModem, "GSM", 10240, NULL, 0, NULL, 0);
         xTaskCreatePinnedToCore(vTaskSD, "SD", 4096, NULL, 2, NULL, 0);
     }
 }
 
 void loop() { vTaskDelete(NULL); }
 
+void enviarMsgCAN(uint32_t id, float valor) {
+    int16_t val = (int16_t)(valor * 100.0f);
+    byte b[2] = {(byte)(val >> 8), (byte)(val & 0xFF)};
+    CAN0.sendMsgBuf(id, 0, 2, b);
+}
+
 // ====================================================================
-// TAREFA CAN (Core 1) -> RECEBE TUDO DAS ECUs E ATUALIZA A STRUCT
+// 3. TAREFAS (TASKS)
 // ====================================================================
+
+// --- TAREFA CAN ---
 void vTaskCAN(void *pvParameters) {
     long unsigned int rxId;
     unsigned char len, rxBuf[8];
@@ -183,37 +151,44 @@ void vTaskCAN(void *pvParameters) {
             dados.timestamp = millis();
             
             if (len == 2) {
+                // Junta os 2 bytes em um inteiro
                 int16_t valorInt = (rxBuf[0] << 8) | rxBuf[1];
+                // Transforma em float (dividindo por 100) para os demais sensores
                 float valorFloat = (float)valorInt / 100.0f;
 
+                // --- DEBUG CAN COM VALORES REAIS ---
+                if (rxId == 0x200) {
+                    Serial.printf("[CAN RX] ID: 0x200 | RPM recebido: %d\n", valorInt);
+                } else {
+                    Serial.printf("[CAN RX] ID: 0x%03X | Valor recebido: %.2f\n", rxId, valorFloat);
+                }
+                // ------------------------------------
+
                 switch (rxId) {
-                    // --- GRUPO 0x200: POWERTRAIN E RODAS DIANTEIRAS ---
-                    case 0x200: dados.rpm = (uint16_t)valorFloat; break; 
+                    case 0x200: dados.rpm = (uint16_t)valorInt; break; 
                     case 0x201: dados.velocidade = valorFloat; break;
                     case 0x202: dados.tempCVT = valorFloat; break;
-                    case 0x203: dados.v_LF = valorFloat; break; // Veio da FECU
-                    case 0x204: dados.v_RF = valorFloat; break; // Veio da FECU
-                    
-                    // --- GRUPO 0x300: RECU (Traseira) ---
+                    case 0x203: dados.v_LF = valorFloat; break; 
+                    case 0x204: dados.v_RF = valorFloat; break; 
                     case 0x300: dados.vBat = valorFloat; break;
                     case 0x301: dados.presTras = valorFloat; break;
                     case 0x303: dados.tempBat = valorFloat; break;
                     case 0x304: dados.perT = valorFloat; break;
                     case 0x305: dados.perF = valorFloat; break;
-
-                    // --- GRUPO 0x400: FECU (Dianteira / Dinâmica) ---
                     case 0x400: dados.pedalFreio = valorFloat; break;
                     case 0x402: dados.presDiant = valorFloat; break;
                     case 0x403: dados.presCM = valorFloat; break;
                     case 0x404: dados.accX = valorFloat; break;
                     case 0x405: dados.accY = valorFloat; break;
                     case 0x406: dados.accZ = valorFloat; break; 
-                    case 0x407: dados.acionamentoDif = valorFloat; break; 
+                    case 0x407: dados.correnteDif = (valorInt > 0); break; 
+                    default:
+                        Serial.printf("   (!) ID desconhecido na lógica: 0x%X\n", rxId);
+                        break;
                 }
             }
             xSemaphoreGive(mutexDados);
 
-            // Grava a 100Hz na fila do SD
             if (millis() - lastLogTime >= 10) {
                 xQueueSend(filaSD, &dados, 0);
                 lastLogTime = millis();
@@ -223,71 +198,67 @@ void vTaskCAN(void *pvParameters) {
     }
 }
 
-// ====================================================================
-// TAREFA PAINEL DWIN (Core 1)
-// ====================================================================
+// --- TAREFA DWIN ---
 void vTaskDWIN(void *pvParameters) {
     uint32_t ultimoTempoBotao = 0;
-
     for (;;) {
-        // --- 1. Lógica do Botão com Debounce ---
         if (digitalRead(PIN_BOTAO_PAINEL) == LOW && (millis() - ultimoTempoBotao > 300)) {
             ultimoTempoBotao = millis();
-            
             if (telaAtual == TELA_PRINCIPAL) telaAtual = TELA_SECUNDARIA;
             else if (telaAtual == TELA_SECUNDARIA) telaAtual = TELA_PRINCIPAL;
             else if (telaAtual == TELA_BOX) telaAtual = TELA_PRINCIPAL;
-            
             forcarMudancaTela = true;
         }
-
-        // --- 2. Troca de Tela ---
+        
         if (forcarMudancaTela) {
             byte frameTela[10] = {0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00, telaAtual};
             Serial2.write(frameTela, 10);
             forcarMudancaTela = false;
         }
-
-        // --- 3. Atualiza Dados ---
+        
         if (telaAtual != TELA_BOX) {
             xSemaphoreTake(mutexDados, portMAX_DELAY);
             uint16_t rpmTela = dados.rpm;
+            uint16_t velTela = (uint16_t)dados.velocidade; // Convertendo para inteiro para enviar ao DWIN
+            uint16_t tempCvtTela = (uint16_t)dados.tempCVT; // Convertendo para inteiro para enviar ao DWIN
             xSemaphoreGive(mutexDados);
 
+            // 1. Envia RPM (VP: 0x31 0x00)
             byte frameRpm[8] = {0x5A, 0xA5, 0x05, 0x82, 0x31, 0x00, (byte)(rpmTela >> 8), (byte)(rpmTela & 0xFF)};
             Serial2.write(frameRpm, 8);
+            vTaskDelay(pdMS_TO_TICKS(10)); 
+            
+            // 2. Envia Velocidade (ATENÇÃO: Altere o 0x32 0x00 para o VP configurado no seu DGUS)
+            byte frameVel[8] = {0x5A, 0xA5, 0x05, 0x82, 0x32, 0x00, (byte)(velTela >> 8), (byte)(velTela & 0xFF)};
+            Serial2.write(frameVel, 8);
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+            // 3. Envia Temp CVT (ATENÇÃO: Altere o 0x33 0x00 para o VP configurado no seu DGUS)
+            byte frameTemp[8] = {0x5A, 0xA5, 0x05, 0x82, 0x33, 0x00, (byte)(tempCvtTela >> 8), (byte)(tempCvtTela & 0xFF)};
+            Serial2.write(frameTemp, 8);
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // 10Hz
+        vTaskDelay(pdMS_TO_TICKS(80)); // Fechando ciclo total em ~100ms
     }
 }
 
-// ====================================================================
-// TAREFA SD CARD (Core 0)
-// ====================================================================
+// --- TAREFA SD ---
 void vTaskSD(void *pvParameters) {
     TelemetriaGlobal d;
     int ct = 0;
-    
     for (;;) {
         if (xQueueReceive(filaSD, &d, portMAX_DELAY)) {
             if (dataFile) {
-                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.2f;%.1f;%.0f;%.0f;%.1f;%.2f;%.2f;%.2f;%.2f;%.2f;%.1f;%.1f;%.0f\n", 
+                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.2f;%.1f;%.0f;%.0f;%.1f;%.2f;%.2f;%.2f;%.2f;%.2f;%.1f;%.1f;%d\n", 
                     d.timestamp, d.rpm, d.velocidade, d.tempCVT, d.vBat, 
                     d.presTras, d.tempBat, d.perT, d.perF, d.pedalFreio, 
-                    d.presDiant, d.presCM, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.acionamentoDif);
-                
-                if (++ct >= 50) { // Flush a cada meio segundo (garante n perder dados na vibração)
-                    dataFile.flush();
-                    ct = 0;
-                }
+                    d.presDiant, d.presCM, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.correnteDif);
+                if (++ct >= 50) { dataFile.flush(); ct = 0; }
             }
         }
     }
 }
 
-// ====================================================================
-// CALLBACK MQTT (Recebe comandos)
-// ====================================================================
+// --- CALLBACK MQTT ---
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String message;
     for (int i = 0; i < length; i++) message += (char)payload[i];
@@ -295,72 +266,64 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (String(topic) == topic_command) {
         StaticJsonDocument<200> doc;
         if (!deserializeJson(doc, message)) {
-            const char* command = doc["command"];
-            if (String(command) == "PIT") {
-                telaAtual = TELA_BOX;
-                forcarMudancaTela = true;
+            if (doc.containsKey("command")) {
+                const char* command = doc["command"];
+                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true; }
+            }
+            if (doc.containsKey("acionamentoDif")) {
+                bool estadoDif = doc["acionamentoDif"];
+                enviarMsgCAN(0x500, estadoDif ? 1.0f : 0.0f);
+            }
+            if (doc.containsKey("acionamentoBuzina")) {
+                bool estadoBuzina = doc["acionamentoBuzina"];
+                enviarMsgCAN(0x501, estadoBuzina ? 1.0f : 0.0f);
             }
         }
     }
 }
 
-// ====================================================================
-// TAREFA MODEM E MQTT (Core 0) - ATUALIZADA COM LÓGICA DE CASCATA
-// ====================================================================
+// --- TAREFA MODEM ---
 void vTaskModem(void *pvParameters) {
     mqttClient.setServer(mqtt_server, mqtt_port);
     mqttClient.setCallback(mqttCallback);
-
+    
     for (;;) {
-        // --- 1. LÓGICA DE CONEXÃO NÃO-BLOQUEANTE ---
         if (!modem.isNetworkConnected()) {
-            // Tenta achar a rede por no máximo 1 segundo (evita travar o Core 0)
-            modem.waitForNetwork(1000); 
+            Serial.print("[MODEM] Procurando rede... ");
+            if (modem.waitForNetwork(3000)) Serial.println("CONECTADO!");
+            else Serial.println("Ainda não.");
         } 
         else if (!modem.isGprsConnected()) {
-            // Se tem rede mas não tem internet, conecta o GPRS
+            Serial.println("[MODEM] Conectando GPRS...");
             modem.gprsConnect(apn, "", "");
         } 
         else if (!mqttClient.connected()) {
-            // Se tem internet mas perdeu o MQTT, reconecta e reassina o tópico
+            Serial.println("[MQTT] Conectando...");
             String clientId = "MECU-" + String(random(0xffff), HEX);
             if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-                mqttClient.subscribe(topic_command); 
+                mqttClient.subscribe(topic_command);
             }
         }
-
-        // --- 2. ENVIO DE DADOS ---
+        
         if (mqttClient.connected()) {
-            StaticJsonDocument<1024> doc; 
-            
+            TelemetriaGlobal d;
             xSemaphoreTake(mutexDados, portMAX_DELAY);
-            doc["rpm"] = dados.rpm;
-            doc["vel"] = dados.velocidade;
-            doc["tCVT"] = dados.tempCVT;
-            doc["vBat"] = dados.vBat;
-            doc["pTras"] = dados.presTras;
-            doc["tBat"] = dados.tempBat;
-            doc["perT"] = dados.perT;
-            doc["perF"] = dados.perF;
-            doc["pedF"] = dados.pedalFreio;
-            doc["pDiant"] = dados.presDiant;
-            doc["pCM"] = dados.presCM;
-            doc["accX"] = dados.accX;
-            doc["accY"] = dados.accY;
-            doc["accZ"] = dados.accZ;
-            doc["vLF"] = dados.v_LF;
-            doc["vRF"] = dados.v_RF;
-            doc["dif"] = dados.acionamentoDif;
+            d = dados;
             xSemaphoreGive(mutexDados);
+
+            StaticJsonDocument<1024> doc; 
+            doc["rpm"] = d.rpm; doc["vel"] = d.velocidade; doc["tCVT"] = d.tempCVT;
+            doc["vBat"] = d.vBat; doc["pTras"] = d.presTras; doc["tBat"] = d.tempBat;
+            doc["perT"] = d.perT; doc["perF"] = d.perF; doc["pedF"] = d.pedalFreio;
+            doc["pDiant"] = d.presDiant; doc["pCM"] = d.presCM; doc["accX"] = d.accX;
+            doc["accY"] = d.accY; doc["accZ"] = d.accZ; doc["vLF"] = d.v_LF;
+            doc["vRF"] = d.v_RF; doc["corrDif"] = d.correnteDif;
 
             char buffer[1024];
             size_t n = serializeJson(doc, buffer);
             mqttClient.publish(topic_telemetry, buffer, n);
-            
             mqttClient.loop();
         }
-        
-        // delay para enviar a 5Hz
         vTaskDelay(pdMS_TO_TICKS(200)); 
     }
 }
