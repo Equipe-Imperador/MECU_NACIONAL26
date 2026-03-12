@@ -279,8 +279,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (!deserializeJson(doc, message)) {
             if (doc.containsKey("command")) {
                 const char* command = doc["command"];
-                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true;  Serial.println("* CHAMADA PARA O BOX RECEBIDA! *");
-}
+                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true;  Serial.println("* CHAMADA PARA O BOX RECEBIDA! *");}
+                if (String(command) == "PISTA") { telaAtual = TELA_PRINCIPAL; forcarMudancaTela = true;  Serial.println("* RETORNAR PISTA RECEBIDO! *");}
             }
             if (doc.containsKey("acionamentoDif")) {
                 bool estadoDif = doc["acionamentoDif"];
