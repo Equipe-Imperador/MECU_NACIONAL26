@@ -1,3 +1,6 @@
+/*
+    MECU
+*/
 #include <mcp_can.h>
 #include <SPI.h>
 #include <SD.h>
@@ -28,9 +31,9 @@
 #define SD_MISO 19
 #define SD_MOSI 23
 
-#define TELA_PRINCIPAL  0  
-#define TELA_SECUNDARIA 1  
-#define TELA_BOX        2  
+#define TELA_PRINCIPAL  0x00  
+#define TELA_SECUNDARIA 0x02  
+#define TELA_BOX        0x01  
 
 volatile uint8_t telaAtual = TELA_PRINCIPAL;
 volatile bool forcarMudancaTela = true; 
@@ -157,14 +160,14 @@ void vTaskCAN(void *pvParameters) {
                 // Transforma em float (dividindo por 100) para os demais sensores
                 float valorFloat = (float)valorInt / 100.0f;
 
-                // --- DEBUG CAN COM VALORES REAIS ---
+               /* // --- DEBUG CAN COM VALORES REAIS ---
                 if (rxId == 0x200) {
                     Serial.printf("[CAN RX] ID: 0x200 | RPM recebido: %d\n", valorInt);
                 } else {
                     Serial.printf("[CAN RX] ID: 0x%03X | Valor recebido: %.2f\n", rxId, valorFloat);
                 }
                 // ------------------------------------
-
+                */
                 switch (rxId) {
                     case 0x200: dados.rpm = (uint16_t)valorInt; break; 
                     case 0x201: dados.velocidade = valorFloat; break;
@@ -237,12 +240,12 @@ void vTaskDWIN(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(10)); 
             
             // 2. Envia Velocidade (ATENÇÃO: Altere o 0x32 0x00 para o VP configurado no seu DGUS)
-            byte frameVel[8] = {0x5A, 0xA5, 0x05, 0x82, 0x32, 0x00, (byte)(velTela >> 8), (byte)(velTela & 0xFF)};
+            byte frameVel[8] = {0x5A, 0xA5, 0x05, 0x82, 0x11, 0x00, (byte)(velTela >> 8), (byte)(velTela & 0xFF)};
             Serial2.write(frameVel, 8);
             vTaskDelay(pdMS_TO_TICKS(10));
 
             // 3. Envia Temp CVT (ATENÇÃO: Altere o 0x33 0x00 para o VP configurado no seu DGUS)
-            byte frameTemp[8] = {0x5A, 0xA5, 0x05, 0x82, 0x33, 0x00, (byte)(tempCvtTela >> 8), (byte)(tempCvtTela & 0xFF)};
+            byte frameTemp[8] = {0x5A, 0xA5, 0x05, 0x82, 0x21, 0x00, (byte)(tempCvtTela >> 8), (byte)(tempCvtTela & 0xFF)};
             Serial2.write(frameTemp, 8);
         }
         vTaskDelay(pdMS_TO_TICKS(80)); // Fechando ciclo total em ~100ms
@@ -276,14 +279,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (!deserializeJson(doc, message)) {
             if (doc.containsKey("command")) {
                 const char* command = doc["command"];
-                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true; }
+                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true;  Serial.println("* CHAMADA PARA O BOX RECEBIDA! *");
+}
             }
             if (doc.containsKey("acionamentoDif")) {
                 bool estadoDif = doc["acionamentoDif"];
+                Serial.println("Input DIF servidor recebido ");
                 enviarMsgCAN(0x500, estadoDif ? 1.0f : 0.0f);
+                
             }
             if (doc.containsKey("acionamentoBuzina")) {
                 bool estadoBuzina = doc["acionamentoBuzina"];
+                Serial.println("Input BUZINA servidor recebido ");
                 enviarMsgCAN(0x501, estadoBuzina ? 1.0f : 0.0f);
             }
         }
