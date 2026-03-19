@@ -1,5 +1,5 @@
 /*
-    MECU
+    MECU - Gerenciamento de Telemetria e DWIN
 */
 #include <mcp_can.h>
 #include <SPI.h>
@@ -32,18 +32,23 @@
 #define SD_MOSI 23
 
 #define TELA_PRINCIPAL  0x00  
-#define TELA_SECUNDARIA 0x02  
+#define TELA_SECUNDARIA 0x02  // Tela de Debug
 #define TELA_BOX        0x01  
 
 volatile uint8_t telaAtual = TELA_PRINCIPAL;
 volatile bool forcarMudancaTela = true; 
+
+// Variáveis Globais do Relógio (Extraídas do Modem)
+volatile uint8_t horaAtual = 0;
+volatile uint8_t minutoAtual = 0;
+uint32_t ultimoSincronismoRelogio = 0;
 
 struct TelemetriaGlobal {
     uint32_t timestamp;
     uint16_t rpm;
     float velocidade, tempCVT, v_LF, v_RF;
     float vBat, presTras, tempBat, perT, perF;
-    float pedalFreio, presDiant, presCM, accX, accY, accZ; 
+    float pedalFreio, presDiant, estercamento, accX, accY, accZ; // presCM substituida por estercamento
     bool correnteDif; 
 } dados;
 
@@ -74,11 +79,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void enviarMsgCAN(uint32_t id, float valor);
 
 // ====================================================================
+// FUNÇÃO AUXILIAR PARA O PAINEL DWIN
+// ====================================================================
+void enviarValorDWIN(uint16_t vp, int16_t valor) {
+    byte frame[8] = {
+        0x5A, 0xA5, 0x05, 0x82, 
+        (byte)(vp >> 8), (byte)(vp & 0xFF), 
+        (byte)(valor >> 8), (byte)(valor & 0xFF)
+    };
+    Serial2.write(frame, 8);
+    vTaskDelay(pdMS_TO_TICKS(5)); // Respiro para não saturar o display
+}
+
+// ====================================================================
 // 2. SETUP
 // ====================================================================
 void setup() {
     Serial.begin(921600);
-    Serial.println("\n [MECU] MODO DEBUG CAN ATIVADO ");
+    Serial.println("\n [MECU] INICIANDO SISTEMA...");
 
     pinMode(PIN_BOTAO_PAINEL, INPUT_PULLUP);
     mutexDados = xSemaphoreCreateMutex();
@@ -106,7 +124,8 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            dataFile.println("ms;rpm;vel;tCVT;vBat;pTras;tBat;perT;perF;pedF;pDiant;pCM;accX;accY;accZ;vLF;vRF;corrDif");
+            // Cabeçalho atualizado: pTras mantida, estrc no lugar de pCM
+            dataFile.println("ms;rpm;vel;tCVT;vBat;pTras;tBat;perT;perF;pedF;pDiant;estrc;accX;accY;accZ;vLF;vRF;corrDif");
             dataFile.flush();
         }
     }
@@ -115,7 +134,8 @@ void setup() {
     esp_task_wdt_deinit(); 
     esp_task_wdt_init(&twdt_config);
 
-    filaSD = xQueueCreate(100, sizeof(TelemetriaGlobal));
+    // Fila do SD aumentada para 200 posições (proteção contra write latency do SD)
+    filaSD = xQueueCreate(200, sizeof(TelemetriaGlobal));
     if (filaSD != NULL) {
         xTaskCreatePinnedToCore(vTaskCAN, "CAN", 4096, NULL, 3, NULL, 1);
         xTaskCreatePinnedToCore(vTaskDWIN, "DWIN", 2048, NULL, 2, NULL, 1);
@@ -141,33 +161,20 @@ void vTaskCAN(void *pvParameters) {
     long unsigned int rxId;
     unsigned char len, rxBuf[8];
     uint32_t lastLogTime = 0;
-    
     esp_task_wdt_add(NULL);
 
     for (;;) {
         esp_task_wdt_reset();
         
-        // Usando o 'while' para esvaziar completamente o buffer do MCP2515 a cada ciclo
         while (CAN0.checkReceive() == CAN_MSGAVAIL) {
             CAN0.readMsgBuf(&rxId, &len, rxBuf);
-            
             xSemaphoreTake(mutexDados, portMAX_DELAY);
             dados.timestamp = millis();
             
             if (len == 2) {
-                // Junta os 2 bytes em um inteiro
                 int16_t valorInt = (rxBuf[0] << 8) | rxBuf[1];
-                // Transforma em float (dividindo por 100) para os demais sensores
                 float valorFloat = (float)valorInt / 100.0f;
 
-               /* // --- DEBUG CAN COM VALORES REAIS ---
-                if (rxId == 0x200) {
-                    Serial.printf("[CAN RX] ID: 0x200 | RPM recebido: %d\n", valorInt);
-                } else {
-                    Serial.printf("[CAN RX] ID: 0x%03X | Valor recebido: %.2f\n", rxId, valorFloat);
-                }
-                // ------------------------------------
-                */
                 switch (rxId) {
                     case 0x200: dados.rpm = (uint16_t)valorInt; break; 
                     case 0x201: dados.velocidade = valorFloat; break;
@@ -181,21 +188,16 @@ void vTaskCAN(void *pvParameters) {
                     case 0x305: dados.perF = valorFloat; break;
                     case 0x400: dados.pedalFreio = valorFloat; break;
                     case 0x402: dados.presDiant = valorFloat; break;
-                    case 0x403: dados.presCM = valorFloat; break;
+                    case 0x403: dados.estercamento = valorFloat; break; // Substituiu a presCM
                     case 0x404: dados.accX = valorFloat; break;
                     case 0x405: dados.accY = valorFloat; break;
                     case 0x406: dados.accZ = valorFloat; break; 
                     case 0x407: dados.correnteDif = (valorInt > 0); break; 
-                    default:
-                        Serial.printf("   (!) ID desconhecido na lógica: 0x%X\n", rxId);
-                        break;
                 }
             }
             xSemaphoreGive(mutexDados);
         }
 
-        // Envio para a fila do SD movido para fora do while
-        // Garante que o SD vai receber o frame mais atualizado a cada 10ms cravados
         if (millis() - lastLogTime >= 10) {
             xSemaphoreTake(mutexDados, portMAX_DELAY);
             TelemetriaGlobal copiaDados = dados;
@@ -204,7 +206,6 @@ void vTaskCAN(void *pvParameters) {
             xQueueSend(filaSD, &copiaDados, 0);
             lastLogTime = millis();
         }
-
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
 }
@@ -212,7 +213,9 @@ void vTaskCAN(void *pvParameters) {
 // --- TAREFA DWIN ---
 void vTaskDWIN(void *pvParameters) {
     uint32_t ultimoTempoBotao = 0;
+    
     for (;;) {
+        // Lógica do botão
         if (digitalRead(PIN_BOTAO_PAINEL) == LOW && (millis() - ultimoTempoBotao > 300)) {
             ultimoTempoBotao = millis();
             if (telaAtual == TELA_PRINCIPAL) telaAtual = TELA_SECUNDARIA;
@@ -221,34 +224,55 @@ void vTaskDWIN(void *pvParameters) {
             forcarMudancaTela = true;
         }
         
+        // Força a mudança de tela
         if (forcarMudancaTela) {
             byte frameTela[10] = {0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00, telaAtual};
             Serial2.write(frameTela, 10);
             forcarMudancaTela = false;
         }
         
-        if (telaAtual != TELA_BOX) {
-            xSemaphoreTake(mutexDados, portMAX_DELAY);
-            uint16_t rpmTela = dados.rpm;
-            uint16_t velTela = (uint16_t)dados.velocidade; // Convertendo para inteiro para enviar ao DWIN
-            uint16_t tempCvtTela = (uint16_t)dados.tempCVT; // Convertendo para inteiro para enviar ao DWIN
-            xSemaphoreGive(mutexDados);
+        // Copia os dados
+        xSemaphoreTake(mutexDados, portMAX_DELAY);
+        TelemetriaGlobal d = dados; 
+        xSemaphoreGive(mutexDados);
 
-            // 1. Envia RPM (VP: 0x31 0x00)
-            byte frameRpm[8] = {0x5A, 0xA5, 0x05, 0x82, 0x31, 0x00, (byte)(rpmTela >> 8), (byte)(rpmTela & 0xFF)};
-            Serial2.write(frameRpm, 8);
-            vTaskDelay(pdMS_TO_TICKS(10)); 
-            
-            // 2. Envia Velocidade (ATENÇÃO: Altere o 0x32 0x00 para o VP configurado no seu DGUS)
-            byte frameVel[8] = {0x5A, 0xA5, 0x05, 0x82, 0x11, 0x00, (byte)(velTela >> 8), (byte)(velTela & 0xFF)};
-            Serial2.write(frameVel, 8);
-            vTaskDelay(pdMS_TO_TICKS(10));
-
-            // 3. Envia Temp CVT (ATENÇÃO: Altere o 0x33 0x00 para o VP configurado no seu DGUS)
-            byte frameTemp[8] = {0x5A, 0xA5, 0x05, 0x82, 0x21, 0x00, (byte)(tempCvtTela >> 8), (byte)(tempCvtTela & 0xFF)};
-            Serial2.write(frameTemp, 8);
+        // 1. DADOS GERAIS (Todas as telas)
+        enviarValorDWIN(0x3000, (int16_t)d.velocidade);
+        enviarValorDWIN(0x3010, (int16_t)d.rpm);
+        
+        // 2. HORÁRIO E DIFERENCIAL (Principal e Box)
+        if (telaAtual == TELA_PRINCIPAL || telaAtual == TELA_BOX) {
+            enviarValorDWIN(0x4600, horaAtual);
+            enviarValorDWIN(0x4610, minutoAtual);
         }
-        vTaskDelay(pdMS_TO_TICKS(80)); // Fechando ciclo total em ~100ms
+
+        // 3. APENAS TELA PRINCIPAL (0x00)
+        if (telaAtual == TELA_PRINCIPAL) {
+            enviarValorDWIN(0x4500, d.correnteDif ? 1 : 0); 
+            enviarValorDWIN(0x3020, (int16_t)d.tempCVT);    
+        }
+
+        // 4. APENAS TELA DEBUG (0x02)
+        if (telaAtual == TELA_SECUNDARIA) {
+            enviarValorDWIN(0x3020, (int16_t)d.tempCVT);
+            enviarValorDWIN(0x3030, (int16_t)(d.vBat * 10)); 
+            enviarValorDWIN(0x3040, (int16_t)d.tempBat);
+            enviarValorDWIN(0x3050, d.correnteDif ? 1 : 0);
+            enviarValorDWIN(0x3060, (int16_t)d.pedalFreio);
+            enviarValorDWIN(0x3070, (int16_t)d.presDiant);
+            
+            // Aqui pTras assumiu o lugar de pCM e esterçamento ganhou um novo VP
+            enviarValorDWIN(0x3080, (int16_t)d.presTras); 
+            enviarValorDWIN(0x3140, (int16_t)(d.estercamento * 10)); // Multiplicado por 10 p/ 1 casa decimal
+            
+            enviarValorDWIN(0x3090, (int16_t)(d.accX * 100)); 
+            enviarValorDWIN(0x3100, (int16_t)(d.accY * 100));
+            enviarValorDWIN(0x3110, (int16_t)(d.accZ * 100));
+            enviarValorDWIN(0x3120, (int16_t)d.v_RF); 
+            enviarValorDWIN(0x3130, (int16_t)d.v_LF); 
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
 }
 
@@ -259,10 +283,11 @@ void vTaskSD(void *pvParameters) {
     for (;;) {
         if (xQueueReceive(filaSD, &d, portMAX_DELAY)) {
             if (dataFile) {
-                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.2f;%.1f;%.0f;%.0f;%.1f;%.2f;%.2f;%.2f;%.2f;%.2f;%.1f;%.1f;%d\n", 
+                // Atualizado: presTras e estercamento no lugar correto
+                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.2f;%.1f;%.0f;%.0f;%.1f;%.2f;%.1f;%.2f;%.2f;%.2f;%.1f;%.1f;%d\n", 
                     d.timestamp, d.rpm, d.velocidade, d.tempCVT, d.vBat, 
                     d.presTras, d.tempBat, d.perT, d.perF, d.pedalFreio, 
-                    d.presDiant, d.presCM, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.correnteDif);
+                    d.presDiant, d.estercamento, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.correnteDif);
                 if (++ct >= 50) { dataFile.flush(); ct = 0; }
             }
         }
@@ -279,18 +304,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (!deserializeJson(doc, message)) {
             if (doc.containsKey("command")) {
                 const char* command = doc["command"];
-                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true;  Serial.println("* CHAMADA PARA O BOX RECEBIDA! *");}
-                if (String(command) == "PISTA") { telaAtual = TELA_PRINCIPAL; forcarMudancaTela = true;  Serial.println("* RETORNAR PISTA RECEBIDO! *");}
+                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true; }
+                if (String(command) == "PISTA") { telaAtual = TELA_PRINCIPAL; forcarMudancaTela = true; }
             }
             if (doc.containsKey("acionamentoDif")) {
                 bool estadoDif = doc["acionamentoDif"];
-                Serial.println("Input DIF servidor recebido ");
                 enviarMsgCAN(0x500, estadoDif ? 1.0f : 0.0f);
-                
             }
             if (doc.containsKey("acionamentoBuzina")) {
                 bool estadoBuzina = doc["acionamentoBuzina"];
-                Serial.println("Input BUZINA servidor recebido ");
                 enviarMsgCAN(0x501, estadoBuzina ? 1.0f : 0.0f);
             }
         }
@@ -321,6 +343,25 @@ void vTaskModem(void *pvParameters) {
         }
         
         if (mqttClient.connected()) {
+            // Sincroniza o relógio a cada 60 segundos
+            if (millis() - ultimoSincronismoRelogio > 60000 || ultimoSincronismoRelogio == 0) {
+                String tempoRede = modem.getNetworkTime(); 
+                int indiceVirgula = tempoRede.indexOf(',');
+                
+                if (indiceVirgula != -1 && tempoRede.length() >= indiceVirgula + 6) {
+                    String strHora = tempoRede.substring(indiceVirgula + 1, indiceVirgula + 3);
+                    String strMinuto = tempoRede.substring(indiceVirgula + 4, indiceVirgula + 6);
+                    
+                    int horaCorrigida = strHora.toInt() - 3; // Ajuste para UTC-3 (Horário de Brasília)
+                    if (horaCorrigida < 0) horaCorrigida += 24; 
+                    
+                    horaAtual = (uint8_t)horaCorrigida;
+                    minutoAtual = (uint8_t)strMinuto.toInt();
+                }
+                ultimoSincronismoRelogio = millis();
+            }
+
+            // Envia Telemetria MQTT
             TelemetriaGlobal d;
             xSemaphoreTake(mutexDados, portMAX_DELAY);
             d = dados;
@@ -330,9 +371,10 @@ void vTaskModem(void *pvParameters) {
             doc["rpm"] = d.rpm; doc["vel"] = d.velocidade; doc["tCVT"] = d.tempCVT;
             doc["vBat"] = d.vBat; doc["pTras"] = d.presTras; doc["tBat"] = d.tempBat;
             doc["perT"] = d.perT; doc["perF"] = d.perF; doc["pedF"] = d.pedalFreio;
-            doc["pDiant"] = d.presDiant; doc["pCM"] = d.presCM; doc["accX"] = d.accX;
-            doc["accY"] = d.accY; doc["accZ"] = d.accZ; doc["vLF"] = d.v_LF;
-            doc["vRF"] = d.v_RF; doc["corrDif"] = d.correnteDif;
+            doc["pDiant"] = d.presDiant; 
+            doc["estrc"] = d.estercamento; // Substituiu doc["pCM"]
+            doc["accX"] = d.accX; doc["accY"] = d.accY; doc["accZ"] = d.accZ; 
+            doc["vLF"] = d.v_LF; doc["vRF"] = d.v_RF; doc["corrDif"] = d.correnteDif;
 
             char buffer[1024];
             size_t n = serializeJson(doc, buffer);
