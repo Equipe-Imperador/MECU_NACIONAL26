@@ -48,7 +48,7 @@ struct TelemetriaGlobal {
     uint16_t rpm;
     float velocidade, tempCVT, v_LF, v_RF;
     float vBat, presTras, tempBat, perT, perF;
-    float pedalFreio, presDiant, estercamento, accX, accY, accZ; // presCM substituida por estercamento
+    float pedalFreio, presDiant, estercamento, accX, accY, accZ; 
     bool correnteDif; 
 } dados;
 
@@ -124,7 +124,6 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            // Cabeçalho atualizado: pTras mantida, estrc no lugar de pCM
             dataFile.println("ms;rpm;vel;tCVT;vBat;pTras;tBat;perT;perF;pedF;pDiant;estrc;accX;accY;accZ;vLF;vRF;corrDif");
             dataFile.flush();
         }
@@ -134,7 +133,6 @@ void setup() {
     esp_task_wdt_deinit(); 
     esp_task_wdt_init(&twdt_config);
 
-    // Fila do SD aumentada para 200 posições (proteção contra write latency do SD)
     filaSD = xQueueCreate(200, sizeof(TelemetriaGlobal));
     if (filaSD != NULL) {
         xTaskCreatePinnedToCore(vTaskCAN, "CAN", 4096, NULL, 3, NULL, 1);
@@ -182,7 +180,7 @@ void vTaskCAN(void *pvParameters) {
                     case 0x203: dados.v_LF = valorFloat; break; 
                     case 0x204: dados.v_RF = valorFloat; break; 
                     case 0x300: dados.vBat = valorFloat; break;
-                    case 0x301: dados.presTras = valorFloat; break;
+                    case 0x301: dados.presTras = valorFloat; break; // Lida da RECU
                     case 0x303: dados.tempBat = valorFloat; break;
                     case 0x304: dados.perT = valorFloat; break;
                     case 0x305: dados.perF = valorFloat; break;
@@ -258,12 +256,18 @@ void vTaskDWIN(void *pvParameters) {
             enviarValorDWIN(0x3030, (int16_t)(d.vBat * 10)); 
             enviarValorDWIN(0x3040, (int16_t)d.tempBat);
             enviarValorDWIN(0x3050, d.correnteDif ? 1 : 0);
+            
+            // Pedal Freio e Pressões são enviadas sem multiplicar (inteiros puros)
             enviarValorDWIN(0x3060, (int16_t)d.pedalFreio);
             enviarValorDWIN(0x3070, (int16_t)d.presDiant);
-            
-            // Aqui pTras assumiu o lugar de pCM e esterçamento ganhou um novo VP
             enviarValorDWIN(0x3080, (int16_t)d.presTras); 
-            enviarValorDWIN(0x3140, (int16_t)(d.estercamento * 10)); // Multiplicado por 10 p/ 1 casa decimal
+            
+            // Perinhas (0 ou 1 enviados como Data Variable)
+            enviarValorDWIN(0x3140, (d.perT > 0.5f) ? 1 : 0);
+            enviarValorDWIN(0x3150, (d.perF > 0.5f) ? 1 : 0);
+            
+            // Esterçamento no VP correto e multiplicado por 10 para ter a casa decimal na DWIN
+            enviarValorDWIN(0x3160, (int16_t)(d.estercamento * 10)); 
             
             enviarValorDWIN(0x3090, (int16_t)(d.accX * 100)); 
             enviarValorDWIN(0x3100, (int16_t)(d.accY * 100));
@@ -283,8 +287,8 @@ void vTaskSD(void *pvParameters) {
     for (;;) {
         if (xQueueReceive(filaSD, &d, portMAX_DELAY)) {
             if (dataFile) {
-                // Atualizado: presTras e estercamento no lugar correto
-                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.2f;%.1f;%.0f;%.0f;%.1f;%.2f;%.1f;%.2f;%.2f;%.2f;%.1f;%.1f;%d\n", 
+                // %.0f aplicado nas pressões (PSI), estercamento e pedal (RAW) para não sujar o CSV com zeros
+                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.0f;%.1f;%.0f;%.0f;%.0f;%.0f;%.0f;%.2f;%.2f;%.2f;%.1f;%.1f;%d\n", 
                     d.timestamp, d.rpm, d.velocidade, d.tempCVT, d.vBat, 
                     d.presTras, d.tempBat, d.perT, d.perF, d.pedalFreio, 
                     d.presDiant, d.estercamento, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.correnteDif);
@@ -343,22 +347,21 @@ void vTaskModem(void *pvParameters) {
         }
         
         if (mqttClient.connected()) {
-            // Sincroniza o relógio a cada 60 segundos
+            // Sincroniza o relógio a cada 60 segundos com o método TinyGSM correto
             if (millis() - ultimoSincronismoRelogio > 60000 || ultimoSincronismoRelogio == 0) {
-                String tempoRede = modem.getNetworkTime(); 
-                int indiceVirgula = tempoRede.indexOf(',');
                 
-                if (indiceVirgula != -1 && tempoRede.length() >= indiceVirgula + 6) {
-                    String strHora = tempoRede.substring(indiceVirgula + 1, indiceVirgula + 3);
-                    String strMinuto = tempoRede.substring(indiceVirgula + 4, indiceVirgula + 6);
-                    
-                    int horaCorrigida = strHora.toInt() - 3; // Ajuste para UTC-3 (Horário de Brasília)
+                int ano, mes, dia, hora, minuto, segundo;
+                float f_tz;
+                
+                if (modem.getNetworkTime(&ano, &mes, &dia, &hora, &minuto, &segundo, &f_tz)) {
+                    int horaCorrigida = hora - 3; // Ajuste para UTC-3 (Horário de Brasília)
                     if (horaCorrigida < 0) horaCorrigida += 24; 
                     
                     horaAtual = (uint8_t)horaCorrigida;
-                    minutoAtual = (uint8_t)strMinuto.toInt();
+                    minutoAtual = (uint8_t)minuto;
+                    
+                    ultimoSincronismoRelogio = millis();
                 }
-                ultimoSincronismoRelogio = millis();
             }
 
             // Envia Telemetria MQTT
@@ -372,7 +375,7 @@ void vTaskModem(void *pvParameters) {
             doc["vBat"] = d.vBat; doc["pTras"] = d.presTras; doc["tBat"] = d.tempBat;
             doc["perT"] = d.perT; doc["perF"] = d.perF; doc["pedF"] = d.pedalFreio;
             doc["pDiant"] = d.presDiant; 
-            doc["estrc"] = d.estercamento; // Substituiu doc["pCM"]
+            doc["estrc"] = d.estercamento; 
             doc["accX"] = d.accX; doc["accY"] = d.accY; doc["accZ"] = d.accZ; 
             doc["vLF"] = d.v_LF; doc["vRF"] = d.v_RF; doc["corrDif"] = d.correnteDif;
 
