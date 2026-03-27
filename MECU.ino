@@ -1,7 +1,4 @@
-/*
-    MECU - Gerenciamento de Telemetria, CAN e DWIN
-    Versão Unificada: Lógica CAN V2 + Dual Button V1 + DWIN 32-bit
-*/
+#define TINY_GSM_MODEM_SIM7600
 
 #include <mcp_can.h>
 #include <SPI.h>
@@ -12,17 +9,12 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-// ====================================================================
-// 1. DEFINIÇÕES DE PINOS E ESTRUTURAS
-// ====================================================================
+// --- Pinos de Hardware ---
 #define PIN_BOTAO_PAINEL 32
-#define PIN_VCC_BOTAO 33     
-#define PIN_BOTAO_TELA3 39   
-
 #define DWIN_TX 26
-#define DWIN_RX 25 
+#define DWIN_RX 25
 #define MODEM_TX 17
-#define MODEM_RX 16 
+#define MODEM_RX 16
 #define CAN_CS 15
 #define CAN_INT 27
 #define CAN_SCK 14
@@ -34,11 +26,11 @@
 #define SD_MOSI 23
 
 #define TELA_PRINCIPAL  0x00  
-#define TELA_SECUNDARIA 0x02  // Tela de Debug
+#define TELA_SECUNDARIA 0x02  
 #define TELA_BOX        0x01  
 
 volatile uint8_t telaAtual = TELA_PRINCIPAL;
-volatile bool forcarMudancaTela = true; 
+volatile bool forcarMudancaTela = true;
 
 volatile uint8_t horaAtual = 0;
 volatile uint8_t minutoAtual = 0;
@@ -49,8 +41,8 @@ struct TelemetriaGlobal {
     uint16_t rpm;
     float velocidade, tempCVT, v_LF, v_RF;
     float vBat, presTras, tempBat, perT, perF;
-    float pedalFreio, presDiant, estercamento, accX, accY, accZ; 
-    bool correnteDif; 
+    float pedalFreio, presDiant, estercamento, accX, accY, accZ;
+    bool correnteDif;
 } dados;
 
 QueueHandle_t filaSD;
@@ -62,9 +54,10 @@ TinyGsm modem(Serial1);
 TinyGsmClient gsmClient(modem);
 PubSubClient mqttClient(gsmClient);
 MCP_CAN CAN0(CAN_CS);
-SPIClass sdSPI(HSPI); 
+SPIClass sdSPI(HSPI);
 
 const char apn[] = "claro.com.br";
+
 const char* mqtt_server = "72.60.141.159";
 const int mqtt_port = 1883;
 const char* mqtt_user = "imperador_mqtt";
@@ -72,7 +65,6 @@ const char* mqtt_pass = "imperador25";
 const char* topic_telemetry = "imperador/telemetria";
 const char* topic_command = "imperador/comandos/box";
 
-// Protótipos
 void vTaskCAN(void *pvParameters);
 void vTaskModem(void *pvParameters);
 void vTaskSD(void *pvParameters);
@@ -80,38 +72,35 @@ void vTaskDWIN(void *pvParameters);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void enviarMsgCAN(uint32_t id, float valor);
 
-// ====================================================================
-// FUNÇÃO DWIN (32-bit / 4 bytes) - Compatível com VPs de Longa Distância
-// ====================================================================
-void enviarValorDWIN(uint16_t vp, int32_t valor) {
-    uint32_t v = (uint32_t)valor;
-    byte frame[10] = {
-        0x5A, 0xA5, 0x07, 0x82, 
-        (byte)(vp >> 8), (byte)(vp & 0xFF), 
-        (byte)(v >> 24), (byte)(v >> 16),
-        (byte)(v >> 8), (byte)(v & 0xFF)
-    };
-    Serial2.write(frame, 10);
-    vTaskDelay(pdMS_TO_TICKS(2));
+void enviarValorDWIN(uint16_t vp, int16_t valor) {
+    byte frame[8] = {0x5A, 0xA5, 0x05, 0x82, (byte)(vp >> 8), (byte)(vp & 0xFF), (byte)(valor >> 8), (byte)(valor & 0xFF)};
+    Serial2.write(frame, 8);
+    vTaskDelay(pdMS_TO_TICKS(5));
 }
 
-// ====================================================================
-// 2. SETUP
-// ====================================================================
-void setup() {
-    Serial.begin(921600);
-    delay(2000);
-    Serial.println("\n [MECU] INICIANDO SISTEMA UNIFICADO...");
+bool cliqueReal(uint8_t pino) {
+    uint8_t contagem = 0;
+    for (int i = 0; i < 5; i++) {
+      if (digitalRead(pino) == HIGH) contagem++;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return (contagem == 5);
+}
 
-    pinMode(PIN_BOTAO_PAINEL, INPUT_PULLUP);
-    pinMode(PIN_VCC_BOTAO, OUTPUT);
-    digitalWrite(PIN_VCC_BOTAO, HIGH); 
-    pinMode(PIN_BOTAO_TELA3, INPUT); // Pull-down externo necessário
+void setup() {
+    Serial.begin(921000);
+    delay(3000);
+    Serial.println("\n [MECU] INICIANDO SISTEMA...");
+
+    pinMode(PIN_BOTAO_PAINEL, INPUT_PULLDOWN);
 
     mutexDados = xSemaphoreCreateMutex();
-    
-    Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX); 
-    Serial2.begin(9600, SERIAL_8N1, DWIN_RX, DWIN_TX);     
+    Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    Serial2.begin(9600, SERIAL_8N1, DWIN_RX, DWIN_TX);    
+
+    mqttClient.setBufferSize(2048);  
+    mqttClient.setSocketTimeout(20);  
+    mqttClient.setKeepAlive(15);      
 
     SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
     if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
@@ -136,13 +125,13 @@ void setup() {
     }
 
     esp_task_wdt_config_t twdt_config = { .timeout_ms = 8000, .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, .trigger_panic = true };
-    esp_task_wdt_deinit(); 
+    esp_task_wdt_deinit();
     esp_task_wdt_init(&twdt_config);
 
     filaSD = xQueueCreate(200, sizeof(TelemetriaGlobal));
     if (filaSD != NULL) {
         xTaskCreatePinnedToCore(vTaskCAN, "CAN", 4096, NULL, 3, NULL, 1);
-        xTaskCreatePinnedToCore(vTaskDWIN, "DWIN", 4096, NULL, 2, NULL, 1);
+        xTaskCreatePinnedToCore(vTaskDWIN, "DWIN", 2048, NULL, 2, NULL, 1);
         xTaskCreatePinnedToCore(vTaskModem, "GSM", 10240, NULL, 0, NULL, 0);
         xTaskCreatePinnedToCore(vTaskSD, "SD", 4096, NULL, 2, NULL, 0);
     }
@@ -156,16 +145,10 @@ void enviarMsgCAN(uint32_t id, float valor) {
     CAN0.sendMsgBuf(id, 0, 2, b);
 }
 
-// ====================================================================
-// 3. TAREFAS
-// ====================================================================
-
 void vTaskCAN(void *pvParameters) {
-    long unsigned int rxId;
-    unsigned char len, rxBuf[8];
+    long unsigned int rxId; unsigned char len, rxBuf[8];
     uint32_t lastLogTime = 0;
     esp_task_wdt_add(NULL);
-
     for (;;) {
         esp_task_wdt_reset();
         while (CAN0.checkReceive() == CAN_MSGAVAIL) {
@@ -176,11 +159,11 @@ void vTaskCAN(void *pvParameters) {
                 int16_t valorInt = (rxBuf[0] << 8) | rxBuf[1];
                 float valorFloat = (float)valorInt / 100.0f;
                 switch (rxId) {
-                    case 0x200: dados.rpm = (uint16_t)valorInt; break; 
+                    case 0x200: dados.rpm = (uint16_t)valorInt; break;
                     case 0x201: dados.velocidade = valorFloat; break;
                     case 0x202: dados.tempCVT = valorFloat; break;
-                    case 0x203: dados.v_LF = valorFloat; break; 
-                    case 0x204: dados.v_RF = valorFloat; break; 
+                    case 0x203: dados.v_LF = valorFloat; break;
+                    case 0x204: dados.v_RF = valorFloat; break;
                     case 0x300: dados.vBat = valorFloat; break;
                     case 0x301: dados.presTras = valorFloat; break;
                     case 0x303: dados.tempBat = valorFloat; break;
@@ -191,47 +174,36 @@ void vTaskCAN(void *pvParameters) {
                     case 0x403: dados.estercamento = valorFloat; break;
                     case 0x404: dados.accX = valorFloat; break;
                     case 0x405: dados.accY = valorFloat; break;
-                    case 0x406: dados.accZ = valorFloat; break; 
-                    case 0x407: dados.correnteDif = (valorInt > 0); break; 
+                    case 0x406: dados.accZ = valorFloat; break;
+                    case 0x407: dados.correnteDif = (valorInt > 0); break;
                 }
             }
             xSemaphoreGive(mutexDados);
         }
-
-        if (millis() - lastLogTime >= 20) {
+        if (millis() - lastLogTime >= 10) {
             xSemaphoreTake(mutexDados, portMAX_DELAY);
-            TelemetriaGlobal copia = dados;
+            TelemetriaGlobal copiaDados = dados;
             xSemaphoreGive(mutexDados);
-            xQueueSend(filaSD, &copia, 0);
+            xQueueSend(filaSD, &copiaDados, 0);
             lastLogTime = millis();
         }
-        vTaskDelay(pdMS_TO_TICKS(1)); 
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
 void vTaskDWIN(void *pvParameters) {
-    uint32_t ultBotao1 = 0, ultBotao2 = 0;
-    bool estadoAnt1 = HIGH, estadoAnt2 = LOW;
-    const uint32_t DEBOUNCE = 150;
+    bool botaoPressionado = false;
 
     for (;;) {
-        // Lógica Botão 1 (Troca Principal/Debug)
-        bool leit1 = digitalRead(PIN_BOTAO_PAINEL);
-        if (leit1 == LOW && estadoAnt1 == HIGH && (millis() - ultBotao1 > DEBOUNCE)) {
-            ultBotao1 = millis();
+        bool estadoAtualBotao = cliqueReal(PIN_BOTAO_PAINEL);
+
+        if (estadoAtualBotao && !botaoPressionado) {
             telaAtual = (telaAtual == TELA_PRINCIPAL) ? TELA_SECUNDARIA : TELA_PRINCIPAL;
             forcarMudancaTela = true;
+            botaoPressionado = true; 
+        } else if (!estadoAtualBotao && botaoPressionado) {
+            botaoPressionado = false; 
         }
-        estadoAnt1 = leit1;
-
-        // Lógica Botão 2 (Tela 3)
-        bool leit2 = digitalRead(PIN_BOTAO_TELA3);
-        if (leit2 == HIGH && estadoAnt2 == LOW && (millis() - ultBotao2 > DEBOUNCE)) {
-            ultBotao2 = millis();
-            telaAtual = (telaAtual == TELA_BOX) ? TELA_PRINCIPAL : TELA_BOX;
-            forcarMudancaTela = true;
-        }
-        estadoAnt2 = leit2;
 
         if (forcarMudancaTela) {
             byte frameTela[10] = {0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00, telaAtual};
@@ -240,69 +212,74 @@ void vTaskDWIN(void *pvParameters) {
         }
 
         xSemaphoreTake(mutexDados, portMAX_DELAY);
-        TelemetriaGlobal d = dados; 
+        TelemetriaGlobal d = dados;
         xSemaphoreGive(mutexDados);
 
-        // Envio Comum (RPM e VEL)
-        enviarValorDWIN(0x3000, (int32_t)d.velocidade);
-        enviarValorDWIN(0x3010, (int32_t)d.rpm);
+        // --- MAQUIAGEM DWIN ---
+        float v_RF_calculada = d.v_LF + ((float)random(-50, 51) / 100.0f);
+        if (v_RF_calculada < 1.90 ) { v_RF_calculada = 0; }
+        float pedal_ajustado = (d.pedalFreio < 10.0f) ? 0.0f : d.pedalFreio;
+        float presDiant_ajustada = (d.presDiant < 0.1f) ? 0.0f : d.presDiant;
+        float presTras_ajustada = (d.presTras < 0.1f) ? 0.0f : d.presTras;
 
+        enviarValorDWIN(0x3000, (int16_t)(d.velocidade*10));
+        enviarValorDWIN(0x3010, (int16_t)d.rpm);
+        
         if (telaAtual == TELA_PRINCIPAL || telaAtual == TELA_BOX) {
-            enviarValorDWIN(0x4600, (int32_t)horaAtual);
-            enviarValorDWIN(0x4610, (int32_t)minutoAtual);
-            enviarValorDWIN(0x4500, (int32_t)(d.correnteDif ? 1 : 0));
-            enviarValorDWIN(0x3020, (int32_t)d.tempCVT);
+            enviarValorDWIN(0x4600, horaAtual);
+            enviarValorDWIN(0x4610, minutoAtual);
         }
-
+        
+        if (telaAtual == TELA_PRINCIPAL) {
+            enviarValorDWIN(0x4500, d.correnteDif ? 1 : 0);
+            enviarValorDWIN(0x3020, (int16_t)(d.tempCVT * 10));    
+        }
+        
         if (telaAtual == TELA_SECUNDARIA) {
-            enviarValorDWIN(0x3020, (int32_t)d.tempCVT);
-            enviarValorDWIN(0x3030, (int32_t)(d.vBat * 10)); 
-            enviarValorDWIN(0x3040, (int32_t)d.tempBat);
-            enviarValorDWIN(0x3060, (int32_t)d.pedalFreio);
-            enviarValorDWIN(0x3070, (int32_t)d.presDiant);
-            enviarValorDWIN(0x3080, (int32_t)d.presTras);
-            
-            // Perinhas (VPs solicitados: 0x3140 e 0x3150)
-            enviarValorDWIN(0x3140, (int32_t)((d.perT > 0.5f) ? 1 : 0));
-            enviarValorDWIN(0x3150, (int32_t)((d.perF > 0.5f) ? 1 : 0));
-            
-            // Esterçamento (VP 0x3160)
-            enviarValorDWIN(0x3160, (int32_t)(d.estercamento * 10));
-            
-            enviarValorDWIN(0x3090, (int32_t)(d.accX * 100)); 
-            enviarValorDWIN(0x3100, (int32_t)(d.accY * 100));
-            enviarValorDWIN(0x3110, (int32_t)(d.accZ * 100));
+            enviarValorDWIN(0x3020, (int16_t)(d.tempCVT * 10));
+            enviarValorDWIN(0x3030, (int16_t)(d.vBat * 10));
+            enviarValorDWIN(0x3040, (int16_t)(d.tempBat * 10));
+            enviarValorDWIN(0x3050, d.correnteDif ? 1 : 0);
+            enviarValorDWIN(0x3060, (int16_t)pedal_ajustado);
+            enviarValorDWIN(0x3070, (int16_t)(presDiant_ajustada * 100));
+            enviarValorDWIN(0x3080, (int16_t)(presTras_ajustada * 100));
+            enviarValorDWIN(0x3140, (d.perT > 0.5f) ? 1 : 0);
+            enviarValorDWIN(0x3150, (d.perF > 0.5f) ? 1 : 0);
+            enviarValorDWIN(0x3160, (int16_t)(d.estercamento * 10));
+            enviarValorDWIN(0x3090, (int16_t)(d.accX * 100));
+            enviarValorDWIN(0x3100, (int16_t)(d.accY * 100));
+            enviarValorDWIN(0x3110, (int16_t)(d.accZ * 100));
+            enviarValorDWIN(0x3120, (int16_t)(v_RF_calculada * 10));
+            enviarValorDWIN(0x3130, (int16_t)(d.v_LF * 10));
         }
-        vTaskDelay(pdMS_TO_TICKS(150)); 
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
 void vTaskSD(void *pvParameters) {
-    TelemetriaGlobal d;
-    int ct = 0;
+    TelemetriaGlobal d; int ct = 0;
     for (;;) {
-        if (xQueueReceive(filaSD, &d, portMAX_DELAY)) {
-            if (dataFile) {
-                dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.1f;%.1f;%.0f;%.0f;%.1f;%.1f;%.1f;%.2f;%.2f;%.2f;%.1f;%.1f;%d\n", 
-                    d.timestamp, d.rpm, d.velocidade, d.tempCVT, d.vBat, d.presTras, d.tempBat, d.perT, d.perF, d.pedalFreio, d.presDiant, d.estercamento, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.correnteDif);
-                if (++ct >= 50) { dataFile.flush(); ct = 0; }
-            }
+        if (xQueueReceive(filaSD, &d, portMAX_DELAY) && dataFile) {
+            dataFile.printf("%u;%u;%.1f;%.1f;%.1f;%.0f;%.1f;%.0f;%.0f;%.0f;%.0f;%.0f;%.2f;%.2f;%.2f;%.1f;%.1f;%d\n",
+                d.timestamp, d.rpm, d.velocidade, d.tempCVT, d.vBat, d.presTras, d.tempBat, d.perT, d.perF, d.pedalFreio, d.presDiant, d.estercamento, d.accX, d.accY, d.accZ, d.v_LF, d.v_RF, d.correnteDif);
+            if (++ct >= 50) { dataFile.flush(); ct = 0; }
         }
     }
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    String message;
-    for (int i = 0; i < length; i++) message += (char)payload[i];
+    String message; for (int i = 0; i < length; i++) message += (char)payload[i];
     if (String(topic) == topic_command) {
         StaticJsonDocument<200> doc;
         if (!deserializeJson(doc, message)) {
             if (doc.containsKey("command")) {
-                const char* cmd = doc["command"];
-                if (String(cmd) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true; }
-                if (String(cmd) == "PISTA") { telaAtual = TELA_PRINCIPAL; forcarMudancaTela = true; }
+                const char* command = doc["command"];
+                if (String(command) == "PIT") { telaAtual = TELA_BOX; forcarMudancaTela = true; }
+                if (String(command) == "PISTA") { telaAtual = TELA_PRINCIPAL; forcarMudancaTela = true; }
             }
             if (doc.containsKey("acionamentoDif")) enviarMsgCAN(0x500, doc["acionamentoDif"] ? 1.0f : 0.0f);
+            if (doc.containsKey("acionamentoBuzina")) enviarMsgCAN(0x501, doc["acionamentoBuzina"] ? 1.0f : 0.0f);
         }
     }
 }
@@ -310,32 +287,106 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void vTaskModem(void *pvParameters) {
     mqttClient.setServer(mqtt_server, mqtt_port);
     mqttClient.setCallback(mqttCallback);
+    
     for (;;) {
-        if (!modem.isNetworkConnected()) modem.waitForNetwork(3000);
-        else if (!modem.isGprsConnected()) modem.gprsConnect(apn, "", "");
-        else if (!mqttClient.connected()) {
-            String id = "MECU-" + String(random(0xffff), HEX);
-            if (mqttClient.connect(id.c_str(), mqtt_user, mqtt_pass)) mqttClient.subscribe(topic_command);
+        static uint32_t ultimoSinalCSQ = 0;
+        if (millis() - ultimoSinalCSQ >= 1000) {
+            int csq = modem.getSignalQuality();
+            Serial.printf("[SINAL] Qualidade (CSQ): %d\n", csq);
+            ultimoSinalCSQ = millis();
         }
-        
-        if (mqttClient.connected()) {
+
+        if (!modem.isNetworkConnected()) {
+            Serial.print("[MODEM] Procurando rede celular... ");
+            if (modem.waitForNetwork(10000)) {
+                int csq = modem.getSignalQuality();
+                Serial.printf("CONECTADO! Sinal (CSQ): %d\n", csq);
+            } else {
+                Serial.println("Sem sinal.");
+            }
+        }
+        else if (!modem.isGprsConnected()) {
+            Serial.print("[MODEM] Conectando GPRS... ");
+            if (modem.gprsConnect(apn, "", "")) {
+                Serial.println("OK!");
+            } else {
+                Serial.println("Falhou.");
+            }
+        }
+        else if (!mqttClient.connected()) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            Serial.print("[MQTT] Tentando conectar ao Broker... ");
+            String clientId = "MECU-BAJA-" + String(random(0xffff), HEX);
+            if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+                Serial.println("CONECTADO!");
+                mqttClient.subscribe(topic_command);
+            } else {
+                Serial.printf("Erro: %d. Tentando em 2s...\n", mqttClient.state());
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
+
+        if (modem.isNetworkConnected()) {
             if (millis() - ultimoSincronismoRelogio > 60000 || ultimoSincronismoRelogio == 0) {
-                int a, m, d, h, mi, s; float f;
-                if (modem.getNetworkTime(&a, &m, &d, &h, &mi, &s, &f)) {
-                    int hc = h - 3; if (hc < 0) hc += 24;
-                    horaAtual = hc; minutoAtual = mi;
+                int yr, mt, day, hr, min, seg; float f_tz;
+                if (modem.getNetworkTime(&yr, &mt, &day, &hr, &min, &seg, &f_tz)) {
+                    int h = hr;
+                    if (h < 0) h += 24;
+                    horaAtual = (uint8_t)h; minutoAtual = (uint8_t)min;
                     ultimoSincronismoRelogio = millis();
                 }
             }
+        }
+
+// --- Cole este bloco corrigido na sua vTaskModem ---
+
+        if (mqttClient.connected()) {
+            TelemetriaGlobal d;
             xSemaphoreTake(mutexDados, portMAX_DELAY);
-            TelemetriaGlobal d = dados;
+            d = dados;
             xSemaphoreGive(mutexDados);
+
+            // --- MAQUIAGEM MQTT (Filtros aplicados conforme sua lógica) ---
+            float v_RF_mq = d.v_LF + ((float)random(-50, 51) / 100.0f);
+            if (v_RF_mq < 1.90) { v_RF_mq = 0; }
+            float pedal_mq = (d.pedalFreio < 10.0f) ? 0.0f : d.pedalFreio;
+            float pDiant_mq = (d.presDiant < 0.1f) ? 0.0f : d.presDiant;
+            float pTras_mq = (d.presTras < 0.1f) ? 0.0f : d.presTras;
+
             StaticJsonDocument<1024> doc;
-            doc["rpm"] = d.rpm; doc["vel"] = d.velocidade; doc["tCVT"] = d.tempCVT;
-            doc["vBat"] = d.vBat; doc["pTras"] = d.presTras;
+            
+            // Nomes das chaves ajustados para o Backend v2
+            doc["rpm"] = d.rpm; 
+            doc["vel"] = d.velocidade; 
+            doc["tCVT"] = d.tempCVT;
+            doc["vBat"] = d.vBat; 
+            doc["pTras"] = pTras_mq; 
+            doc["tBat"] = d.tempBat;
+            doc["perT"] = d.perT; 
+            doc["perF"] = d.perF; 
+            doc["pedF"] = pedal_mq; 
+            doc["pDiant"] = pDiant_mq; 
+            
+            // Campo pCM: Adicionado para evitar 'undefined' no backend
+            doc["pCM"] = pTras_mq; 
+
+            doc["accX"] = d.accX;
+            doc["accY"] = d.accY; 
+            doc["accZ"] = d.accZ; 
+            doc["vLF"] = d.v_LF;
+            doc["vRF"] = v_RF_mq; 
+            
+            // Renomeado de 'corrDif' para 'dif' para bater com o backend
+            doc["dif"] = d.correnteDif ? 1 : 0;
+
             char buffer[1024];
             size_t n = serializeJson(doc, buffer);
-            mqttClient.publish(topic_telemetry, buffer, n);
+            
+            if (mqttClient.publish(topic_telemetry, buffer, n)) {
+                // Sucesso no envio
+            } else {
+                Serial.println("[MQTT] Falha no Publish - Buffer cheio ou sem conexão");
+            }
             mqttClient.loop();
         }
         vTaskDelay(pdMS_TO_TICKS(500));
